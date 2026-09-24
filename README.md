@@ -55,3 +55,32 @@ direct; q-wire combinations follow in lexicographic order. Values must satisfy
 `1 <= q <= n <= min(20, MaxFramesPerCol)` and produce at most 256 logical frames.
 Missing or inconsistent encoding metadata is rejected. Without either encoding
 field, the writer retains the legacy direct-strobe format and output bytes.
+
+## Current limits and wider interfaces
+
+The matching FABulous implementation currently supports 20 physical frame
+strobes and 32 data bits per frame. The q-out-of-n algorithm itself is not tied
+to those widths. With `M = MaxFramesPerCol` and `B = FrameBitsPerRow`, capacity
+is `(M - n + binomial(n, q)) * B` configuration bits per tile.
+
+The writer already uses the supplied widths for masks, frame storage and
+packing. Remaining validation limits are explicit:
+
+- `_resolve_frame_masks` restricts the encoded group to
+  `1 <= q <= n <= min(20, MaxFramesPerCol)`.
+- Its logical-frame check uses the actual physical width and caps the result
+  at 256 frames to bound decoder size.
+- FABulous's `FrameStrobeEncoding` also caps `q` and `n` at 20, but its capacity
+  check still uses the literal `20 - n + binomial(n, q)`.
+
+When wider interfaces are supported, generalize the validation in both
+repositories together. Existing 2-of-6 encoding can scale within the current
+limits; groups larger than 20 require lifting the group-size restriction.
+The mask-table and AND-decoder approach can remain the same.
+
+Removing the guards alone is insufficient: the configuration controller,
+frame data transport and binary word layout must support the new widths.
+Frame strobes must not overlap the column-address or desynchronization fields;
+the writer checks these boundaries in `_resolve_bitstream_format`. Add
+end-to-end tests against the matching configuration RTL before claiming wider
+support. This note does not change the current limits or supported interface.
