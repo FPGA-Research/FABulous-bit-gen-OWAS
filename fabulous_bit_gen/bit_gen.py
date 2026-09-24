@@ -32,6 +32,7 @@ import re
 import sys
 from dataclasses import dataclass
 from importlib.metadata import version as _pkg_version
+from itertools import combinations
 from pathlib import Path
 
 from fasm import (
@@ -80,7 +81,71 @@ class BitstreamFormat:
     desync_bit: int
     include_border_rows: bool = False
     fabulous_version: str = "1.0"
+    frame_strobe_masks: tuple[int, ...] = ()
     multi_clk_domains: bool = False
+
+    @property
+    def frame_masks(self) -> tuple[int, ...]:
+        """Return physical write masks, defaulting to legacy direct strobes."""
+        return self.frame_strobe_masks or tuple(
+            1 << frame for frame in range(self.max_frames_per_col)
+        )
+
+    @property
+    def logical_frames_per_col(self) -> int:
+        """Return storage capacity separately from physical strobe width."""
+        return len(self.frame_masks)
+
+
+def _resolve_frame_masks(spec_dict: dict, physical_strobes: int) -> tuple[int, ...]:
+    """Validate the optional q-out-of-n mapping exported by FABulous.
+
+    Parameters
+    ----------
+    spec_dict : dict
+        Bitstream specification, including optional ArchSpecs encoding fields.
+    physical_strobes : int
+        Unchanged physical FrameStrobe width.
+
+    Returns
+    -------
+    tuple[int, ...]
+        Validated address masks, or an empty tuple for legacy specifications.
+
+    Raises
+    ------
+    ValueError
+        If the code or mask table is missing, invalid, or inconsistent.
+    """
+    arch = spec_dict.get("ArchSpecs", {})
+    if "FrameStrobeEncoding" not in arch and "FrameStrobeMasks" not in arch:
+        return ()
+    encoding = arch.get("FrameStrobeEncoding")
+    if not isinstance(encoding, dict) or set(encoding) != {"kind", "q", "n"}:
+        raise ValueError("FrameStrobeEncoding requires kind, q and n")
+    q, n = encoding["q"], encoding["n"]
+    if (
+        encoding["kind"] != "q_of_n"
+        or type(q) is not int
+        or type(n) is not int
+        or not 1 <= q <= n <= min(20, physical_strobes)
+    ):
+        raise ValueError("FrameStrobeEncoding requires q_of_n with 1 <= q <= n <= 20")
+    direct = physical_strobes - n
+    if direct + math.comb(n, q) > 256:
+        raise ValueError("FrameStrobeEncoding exceeds the 256 logical-frame limit")
+    expected = [1 << i for i in range(direct)] + [
+        sum(1 << i for i in group)
+        for group in combinations(range(direct, physical_strobes), q)
+    ]
+    masks = arch.get("FrameStrobeMasks")
+    if (
+        not isinstance(masks, list)
+        or any(type(mask) is not int for mask in masks)
+        or masks != expected
+    ):
+        raise ValueError("FrameStrobeMasks does not match FrameStrobeEncoding")
+    return tuple(masks)
 
 
 def _resolve_bitstream_format(spec_dict: dict) -> BitstreamFormat:
@@ -96,14 +161,16 @@ def _resolve_bitstream_format(spec_dict: dict) -> BitstreamFormat:
         logger.debug(f"{key} missing in bitstream spec; using default {default!r}.")
         return default
 
+    physical_strobes = int(pick("MaxFramesPerCol", MAX_FRAMES_PER_COL))
     fmt = BitstreamFormat(
         frame_bits_per_row=int(pick("FrameBitsPerRow", FRAME_BITS_PER_ROW)),
-        max_frames_per_col=int(pick("MaxFramesPerCol", MAX_FRAMES_PER_COL)),
+        max_frames_per_col=physical_strobes,
         sync_header_hex=str(pick("SyncHeaderHex", SYNC_HEADER_HEX)),
         frame_select_width=int(pick("FrameSelectWidth", FRAME_SELECT_WIDTH)),
         desync_bit=int(pick("DesyncBit", DESYNC_BIT)),
         include_border_rows=bool(pick("IncludeBorderRows", False)),
         fabulous_version=str(pick("FABulousVersion", FABULOUS_VERSION)),
+        frame_strobe_masks=_resolve_frame_masks(spec_dict, physical_strobes),
         multi_clk_domains=bool(pick("MultiClkDomains", False)),
     )
 
@@ -350,7 +417,7 @@ def _build_hdl_strings(
         ``(verilog_str, vhdl_str)``.
     """
     total_bits = (
-        bitstream_format.max_frames_per_col * bitstream_format.frame_bits_per_row
+        bitstream_format.logical_frames_per_col * bitstream_format.frame_bits_per_row
     )
 
     verilog_str = ""
@@ -418,7 +485,7 @@ def _build_csv_and_frame_data(
     """
     csv_str = ""
     bit_array = [
-        [b"" for _ in range(bitstream_format.max_frames_per_col)]
+        [b"" for _ in range(bitstream_format.logical_frames_per_col)]
         for _ in range(num_columns)
     ]
 
@@ -438,7 +505,7 @@ def _build_csv_and_frame_data(
 
             tile_csv = f"{tile_key},{tile_type},{x},{y}\n"
 
-            for frame_idx in range(bitstream_format.max_frames_per_col):
+            for frame_idx in range(bitstream_format.logical_frames_per_col):
                 if tile_type == "NULL":
                     frame_bits = "0" * bitstream_format.frame_bits_per_row
                 else:
@@ -496,14 +563,14 @@ def _build_binary_bitstream(
     for col in range(num_columns):
         for frame_idx, frame_data in enumerate(bit_array[col]):
             # Frame-select word: column in top bits (address),
-            # frame as one-hot bit (select).
+            # frame as the physical strobe mask exported by FABulous.
             frame_select_word = (
                 col
                 << (
                     bitstream_format.frame_bits_per_row
                     - bitstream_format.frame_select_width
                 )
-            ) | (1 << frame_idx)
+            ) | bitstream_format.frame_masks[frame_idx]
             bitstream += frame_select_word.to_bytes(
                 math.ceil(bitstream_format.frame_bits_per_row / 8), byteorder="big"
             )
@@ -550,7 +617,7 @@ def gen_bitstream(fasm_file: str, spec_file: str, bitstream_file: str) -> None:
 
     # initialized zero-filled bit arrays for masked and unmasked bitstreams
     total_bits = (
-        bitstream_format.max_frames_per_col * bitstream_format.frame_bits_per_row
+        bitstream_format.logical_frames_per_col * bitstream_format.frame_bits_per_row
     )
     tile_bits = {tile: [0] * total_bits for tile in spec_dict["TileMap"]}
     tile_bits_no_mask = {tile: [0] * total_bits for tile in spec_dict["TileMap"]}
