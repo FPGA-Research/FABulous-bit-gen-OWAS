@@ -477,3 +477,35 @@ class TestRegressionSensitivity:
             output_base.with_suffix(".csv").read_text()
             != design.reference.csv.read_text()
         )
+
+
+class TestMinimalBitstream:
+    """--minimal output: per column one clear frame, then its non-zero frames."""
+
+    def test_minimal_is_reference_without_zero_frames(
+        self, real_spec_dict, design, temp_output_dir
+    ) -> None:
+        """Minimal .bin equals the reference re-packed as clear + non-zero frames."""
+        spec_file = temp_output_dir / "spec.bin"
+        out = temp_output_dir / "output.bin"
+        with spec_file.open("wb") as f:
+            pickle.dump(real_spec_dict, f)
+
+        gen_bitstream(str(design.fasm_path), str(spec_file), str(out), minimal=True)
+
+        ref = design.reference.bin.read_bytes()
+        # Reference layout: 20-byte header, then (4-byte select + N data) pairs.
+        n_cols = 1 + max(int(k[1:].split("Y")[0]) for k in real_spec_dict["TileMap"])
+        n_pairs = n_cols * 20
+        pair = (len(ref) - 24) // n_pairs
+        body = ref[20:-4]
+        pairs = [body[i : i + pair] for i in range(0, len(body), pair)]
+        expected = ref[:20]
+        for col in range(n_cols):
+            expected += ((col << 27) | 0xFFFFF).to_bytes(4, "big") + bytes(pair - 4)
+            expected += b"".join(
+                p for p in pairs[col * 20 : col * 20 + 20] if any(p[4:])
+            )
+        got = out.read_bytes()
+        assert got == expected + ref[-4:]
+        assert len(got) < len(ref)

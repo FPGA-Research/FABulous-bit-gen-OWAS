@@ -102,7 +102,7 @@ class TestBitGenCLI:
         mock_gen = mocker.patch("fabulous_bit_gen.bit_gen.gen_bitstream")
         mocker.patch("sys.argv", argv)
         bit_gen()
-        mock_gen.assert_called_once_with(*expected_args)
+        mock_gen.assert_called_once_with(*expected_args, minimal=False)
 
     def test_legacy_flag_style_calls_gen_bitstream(self, mocker) -> None:
         """Legacy -genBitstream flag (with dash) should work identically to the
@@ -113,7 +113,9 @@ class TestBitGenCLI:
             ["bit_gen", "-genBitstream", "test.fasm", "spec.bin", "output.bin"],
         )
         bit_gen()
-        mock_gen.assert_called_once_with("test.fasm", "spec.bin", "output.bin")
+        mock_gen.assert_called_once_with(
+            "test.fasm", "spec.bin", "output.bin", minimal=False
+        )
 
     def test_no_subcommand_does_not_call_gen_bitstream(self, mocker) -> None:
         """No subcommand should print help without calling gen_bitstream."""
@@ -121,3 +123,13 @@ class TestBitGenCLI:
         mocker.patch("sys.argv", ["bit_gen"])
         bit_gen()
         mock_gen.assert_not_called()
+
+    def test_minimal_flag_is_passed(self, mocker) -> None:
+        """--minimal should be forwarded to gen_bitstream."""
+        mock_gen = mocker.patch("fabulous_bit_gen.bit_gen.gen_bitstream")
+        mocker.patch(
+            "sys.argv",
+            ["bit_gen", "genBitstream", "--minimal", "a.fasm", "s.bin", "o.bin"],
+        )
+        bit_gen()
+        mock_gen.assert_called_once_with("a.fasm", "s.bin", "o.bin", minimal=True)

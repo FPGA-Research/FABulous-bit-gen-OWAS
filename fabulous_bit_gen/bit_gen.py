@@ -11,6 +11,11 @@ Binary bitstream structure::
         [ frame data bytes          ]  — num_rows × ceil(FrameBitsPerRow/8) bytes
     [ desync frame                  ]  — bit DESYNC_BIT set
 
+With ``minimal=True`` (CLI ``--minimal``), each column first gets one clear
+frame (every strobe bit set, all-zero data), then only its non-zero frames.
+The config latches have no reset, so the clear replaces the omitted zero
+frames; it also works with q-out-of-n strobes, whose decoders AND the lines.
+
 Frame-select word (FrameBitsPerRow-bit, big-endian) — default layout:
   - Bits [31:27]: column index (FrameSelectWidth = 5 bits, normal binary order).
   - Bits [26:21]: unused in the default configuration (always 0).
@@ -539,6 +544,7 @@ def _build_binary_bitstream(
     bit_array: list[list[bytes]],
     num_columns: int,
     bitstream_format: BitstreamFormat,
+    minimal: bool = False,
 ) -> bytes:
     """Assemble binary bitstream: sync header + frame-select/data pairs + desync frame.
 
@@ -550,6 +556,9 @@ def _build_binary_bitstream(
         Total number of columns in the grid.
     bitstream_format : BitstreamFormat
         Wire-format settings.
+    minimal : bool
+        Clear each column with one all-strobes zero frame, then skip frames
+        whose data is all zero.
 
     Returns
     -------
@@ -559,33 +568,42 @@ def _build_binary_bitstream(
     # Add sync header at the start
     bitstream = bytes.fromhex(bitstream_format.sync_header_hex)
 
+    word_bytes = math.ceil(bitstream_format.frame_bits_per_row / 8)
+    col_shift = (
+        bitstream_format.frame_bits_per_row - bitstream_format.frame_select_width
+    )
+    all_strobes = (1 << bitstream_format.max_frames_per_col) - 1
+
+    def frame(col: int, mask: int, data: bytes) -> bytes:
+        # Frame-select word (column in top bits, physical strobe mask) + data.
+        return ((col << col_shift) | mask).to_bytes(word_bytes, "big") + data
+
     # Add one (frame-select word + frame data) pair per frame per column.
+    written = 0
     for col in range(num_columns):
+        if minimal:
+            bitstream += frame(col, all_strobes, bytes(len(bit_array[col][0])))
         for frame_idx, frame_data in enumerate(bit_array[col]):
-            # Frame-select word: column in top bits (address),
-            # frame as the physical strobe mask exported by FABulous.
-            frame_select_word = (
-                col
-                << (
-                    bitstream_format.frame_bits_per_row
-                    - bitstream_format.frame_select_width
-                )
-            ) | bitstream_format.frame_masks[frame_idx]
-            bitstream += frame_select_word.to_bytes(
-                math.ceil(bitstream_format.frame_bits_per_row / 8), byteorder="big"
-            )
-            # Frame data: packed config bits for this column/frame across all rows
-            bitstream += frame_data
+            if minimal and not any(frame_data):
+                continue
+            written += 1
+            bitstream += frame(col, bitstream_format.frame_masks[frame_idx], frame_data)
 
     # Desync frame signals end-of-bitstream.
     desync_frame = (1 << bitstream_format.desync_bit).to_bytes(
         math.ceil(bitstream_format.frame_bits_per_row / 8), byteorder="big"
     )
     bitstream += desync_frame
+    logger.info(
+        f"Wrote {written}/{sum(map(len, bit_array))} frames"
+        f"{f' + {num_columns} column clears' if minimal else ''}."
+    )
     return bitstream
 
 
-def gen_bitstream(fasm_file: str, spec_file: str, bitstream_file: str) -> None:
+def gen_bitstream(
+    fasm_file: str, spec_file: str, bitstream_file: str, minimal: bool = False
+) -> None:
     """Generate bitstream outputs (.csv, .vh, .vhd, .bin) from a FASM file and spec.
 
     Parameters
@@ -597,6 +615,9 @@ def gen_bitstream(fasm_file: str, spec_file: str, bitstream_file: str) -> None:
         (``TileMap``, ``TileSpecs``, ``FrameMap``, ``ArchSpecs``, …).
     bitstream_file : str
         Base output path; extension is replaced for each output format.
+    minimal : bool
+        Clear each column, then write only non-zero frames to the .bin
+        (other outputs are unchanged).
 
     Raises
     ------
@@ -651,6 +672,7 @@ def gen_bitstream(fasm_file: str, spec_file: str, bitstream_file: str) -> None:
         bit_array,
         num_columns,
         bitstream_format,
+        minimal,
     )
 
     output_path = Path(bitstream_file)
@@ -714,11 +736,18 @@ def bit_gen() -> None:
     gen_parser.add_argument(
         "output_file", help="Path to write the output bitstream (.bin)"
     )
+    gen_parser.add_argument(
+        "--minimal",
+        action="store_true",
+        help="Clear each column once, then write only non-zero frames to the .bin",
+    )
 
     args = parser.parse_args()
 
     if args.command == "genBitstream":
-        gen_bitstream(args.fasm_file, args.spec_file, args.output_file)
+        gen_bitstream(
+            args.fasm_file, args.spec_file, args.output_file, minimal=args.minimal
+        )
     else:
         parser.print_help()
 

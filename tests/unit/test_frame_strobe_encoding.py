@@ -101,3 +101,26 @@ def test_reject_invalid_metadata(change):
         arch["FrameStrobeEncoding"]["kind"] = "binary"
     with pytest.raises(ValueError, match="FrameStrobe"):
         _resolve_bitstream_format(spec)
+
+
+def test_minimal_skips_zero_frames_keeps_masks():
+    """With minimal=True: column clears, no zero frames, encoded masks kept."""
+    spec = encoded_spec(2, 6)
+    fmt = _resolve_bitstream_format(spec)
+    zero = bytes(4)
+    data = [[zero] * fmt.logical_frames_per_col for _ in range(2)]
+    data[1][25] = b"\x00\x00\x00\x01"
+    binary = _build_binary_bitstream(data, 2, fmt, minimal=True)
+    mask = spec["ArchSpecs"]["FrameStrobeMasks"][25]
+    clear = 0xFFFFF  # all 20 physical strobes: zeroes every decoded frame
+    assert binary == (
+        bytes.fromhex(fmt.sync_header_hex)
+        + clear.to_bytes(4, "big")
+        + zero
+        + ((1 << 27) | clear).to_bytes(4, "big")
+        + zero
+        + ((1 << 27) | mask).to_bytes(4, "big")
+        + data[1][25]
+        + b"\x00\x10\x00\x00"
+    )
+    assert _build_binary_bitstream(data, 2, fmt) != binary
